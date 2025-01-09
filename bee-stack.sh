@@ -64,15 +64,24 @@ ask_yes_no() {
 }
 
 check_docker() {
+    # Check if RUNTIME is set in the .env file
+    if [ -z "$RUNTIME" ] && [ -f ".env" ]; then
+        RUNTIME=$(grep -E '^RUNTIME=' .env | cut -d'=' -f2 | xargs)
+    fi
+
+    # If RUNTIME is now set, return early
+    if [ -n "$RUNTIME" ]; then
+        return
+    fi
+
     # Check if docker or podman is installed
     local runtime compose_version major minor req_major req_minor
     req_major=$(cut -d'.' -f1 <<< ${REQUIRED_COMPOSE_VERSION})
     req_minor=$(cut -d'.' -f2 <<< ${REQUIRED_COMPOSE_VERSION})
-    
-    
+       
     local existing_runtimes=()
     for runtime in docker podman; do
-      command -v "$runtime" &>/dev/null && existing_runtimes+=("$runtime")
+       command -v "$runtime" &>/dev/null && existing_runtimes+=("$runtime")
     done
 
     if [ ${#existing_runtimes[@]} -eq 0 ]; then
@@ -81,41 +90,49 @@ check_docker() {
       exit 1
     fi
     
-    local runtimes_with_compose=()
-    for runtime in "${existing_runtimes[@]}"; do
-        "$runtime" compose version --short &>/dev/null && runtimes_with_compose+=("$runtime")
-    done
-    
-    if [ ${#runtimes_with_compose[@]} -eq 0 ]; then
-      print_error "Compose extension is not installed for any of the existing runtimes: ${existing_runtimes[*]}"
-      printf "\n${MISSING_COMPOSE_MSG}"
-      exit 2
+    # find docker-compose if it is installed
+    local os_type
+    os_type=$(uname -s)
+    local compose_command
+    if [[ "$os_type" == "Linux" || "$os_type" == "Darwin" ]]; then
+        compose_command="command -v docker-compose"
+    elif [[ "$os_type" == "CYGWIN"* || "$os_type" == "MINGW"* || "$os_type" == "MSYS"* ]]; then
+        compose_command="where docker-compose"
+    else
+        print_error "Unsupported platform: $os_type"
+        exit 1
     fi
-    
-    local compose_versions=()
-    local compose_version_ok=0
-    for runtime in "${runtimes_with_compose[@]}"; do
-      compose_version=$("$runtime" compose version --short || echo "compose_not_found")
 
-      major=$(cut -d'.' -f1 <<< "$compose_version")
-      minor=$(cut -d'.' -f2 <<< "$compose_version")
-
-      compose_versions+=("${runtime} compose ($compose_version)")
-      if [ "$major" -gt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -ge "$req_minor" ]; }; then
-        compose_version_ok=1
-        break
-      fi
-    done
-
-    compose_versions_print=$(IFS=','; echo "${compose_versions[*]}" | sed 's/,/, /g')
-
-    if [ "$compose_version_ok" -eq 0 ]; then
-        print_error "None of compose command versions meets the required version ${REQUIRED_COMPOSE_VERSION}." \
-                    "Found versions: ${compose_versions_print}" \
-                    "Please (re)install a supported runtime"
-        echo ""
-        printf "${MISSING_COMPOSE_MSG}\n"
+    # Check docker-compose executable runs
+    local compose_path
+    compose_path=$($compose_command 2>/dev/null || echo "not_found")
+    if [[ "$compose_path" == "not_found" ]]; then
+        print_error "Compose extension is not installed."
+        printf "\n${MISSING_COMPOSE_MSG}"
         exit 2
+    fi
+
+    # Check version
+    compose_version=$(docker-compose version --short 2>/dev/null || echo "not_found")
+    if [[ "$compose_version" == "not_found" ]]; then
+        print_error "Failed to retrieve compose version. Ensure docker-compose is correctly installed."
+        exit 2
+    else
+        major=$(cut -d'.' -f1 <<< "$compose_version")
+        minor=$(cut -d'.' -f2 <<< "$compose_version")
+
+        if [ "$major" -lt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -lt "$req_minor" ]; }; then
+          print_error "The compose version ($compose_version) does not meet the required version ${REQUIRED_COMPOSE_VERSION}."
+          exit 2
+        fi
+    fi
+
+    # detect if multiple runtime and ask user to choose
+    if [ ${#existing_runtimes[@]} -gt 1 ]; then
+        choose "Multiple runtimes detected. Select the runtime to use" "${existing_runtimes[@]}"
+        runtime="$SELECTED_OPT"
+    else
+        runtime="${existing_runtimes[0]}"
     fi
     RUNTIME="$runtime"
 }
@@ -189,12 +206,15 @@ setup() {
   [[ $SELECTED_OPT == 'openai' ]] && configure_openai
 
   if [ -f ".env" ]; then
+    printf "\n\n"
     [ "$(ask_yes_no ".env file already exists. Do you want to override it?")" = 'no' ] && exit 1
     if [ -n "$(${RUNTIME} compose ps -aq)" ]; then
       [ "$(ask_yes_no "bee-stack data must be removed when changing configuration, are you sure?")" = 'no' ] && exit 1
       clean_stack
     fi
   fi
+
+  echo RUNTIME="$RUNTIME" >> "$TMP_ENV_FILE"
 
   cp "$TMP_ENV_FILE" .env
   [ "$(ask_yes_no "Do you want to start bee-stack now?")" = 'yes' ] && start_stack
